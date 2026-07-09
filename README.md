@@ -1,0 +1,74 @@
+# codex-handoff
+
+Export readable local Codex session context and current Git repository state into a handoff package for another model or coding agent.
+
+## Why
+
+Codex sessions can become hard to continue when switching provider, account, or model. This tool does not modify Codex state. It only reads local session JSONL files and exports the readable parts into Markdown.
+
+It is designed for this workflow:
+
+```text
+old Codex session + current repo state
+        ↓
+.agent_handoff/
+        ↓
+new model / third-party agent continues the task
+```
+
+## Install
+
+From the repository root:
+
+```bash
+python3 -m pip install -e .
+```
+
+Or directly from GitHub:
+
+```bash
+python3 -m pip install git+https://github.com/paperplane123/codex-handoff.git
+```
+
+## Usage
+
+List recent local Codex sessions:
+
+```bash
+codex-handoff list --limit 30
+```
+
+Export a session:
+
+```bash
+codex-handoff export "/path/to/session.jsonl" -o CODEX_SESSION_RAW.md
+```
+
+Create a handoff package for the current repo:
+
+```bash
+codex-handoff make "/path/to/session.jsonl" --repo . --out-dir .agent_handoff
+```
+
+Then ask the next agent:
+
+```text
+Read .agent_handoff/HANDOFF.md and continue the project. First summarize the current state and next steps before changing code.
+```
+
+## What it reads
+
+- `~/.codex/sessions`
+- `~/.codex/archived_sessions`
+- current Git repo state through `git status`, `git diff`, and `git log`
+
+## Limitations
+
+- It does not modify Codex SQLite, rollout files, provider metadata, auth, or config.
+- It does not decrypt `encrypted_content`.
+- It only exports readable text found in local JSONL session files.
+- If the old session is mostly encrypted, the exported transcript will be incomplete.
+
+## License
+
+MIT
