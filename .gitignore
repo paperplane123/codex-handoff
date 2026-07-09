@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+.agent_handoff/
+CODEX_SESSION_RAW.md
+.DS_Store
