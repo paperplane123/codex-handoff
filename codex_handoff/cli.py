@@ -4,6 +4,7 @@ import argparse
 import json
 import pathlib
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -23,6 +24,31 @@ TEXT_KEYS = {
     "input",
     "output",
 }
+
+SYSTEM_TITLE_PREFIXES = (
+    "You are Codex",
+    "You are a coding agent",
+    "You are MiMo",
+    "You are ChatGPT",
+)
+
+
+@dataclass(frozen=True)
+class SessionRecord:
+    path: pathlib.Path
+    mtime: float
+    rows: list[dict[str, Any]]
+    meta: dict[str, Any]
+
+    @property
+    def cwd(self) -> str:
+        value = self.meta.get("cwd") or self.meta.get("working_directory") or self.meta.get("workspace") or ""
+        return str(value)
+
+    @property
+    def provider(self) -> str:
+        value = self.meta.get("model_provider") or self.meta.get("provider") or ""
+        return str(value)
 
 
 def iter_jsonl_files() -> list[pathlib.Path]:
@@ -58,6 +84,21 @@ def get_meta(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(payload, dict):
                 return payload
     return {}
+
+
+def load_records() -> list[SessionRecord]:
+    records: list[SessionRecord] = []
+    for path in iter_jsonl_files():
+        rows = load_jsonl(path)
+        records.append(
+            SessionRecord(
+                path=path,
+                mtime=path.stat().st_mtime,
+                rows=rows,
+                meta=get_meta(rows),
+            )
+        )
+    return records
 
 
 def contains_encrypted(obj: Any) -> bool:
@@ -104,44 +145,116 @@ def compact_texts(texts: Iterable[str]) -> list[str]:
     return clean
 
 
+def looks_like_system_prompt(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.startswith(SYSTEM_TITLE_PREFIXES)
+
+
 def infer_title(rows: list[dict[str, Any]]) -> str:
     texts: list[str] = []
 
-    for row in rows[:80]:
+    for row in rows[:200]:
         walk_text(row, texts)
 
-    for text in compact_texts(texts):
+    compacted = compact_texts(texts)
+
+    for text in compacted:
+        if len(text) > 10 and not looks_like_system_prompt(text):
+            return text.replace("\n", " ")[:100]
+
+    for text in compacted:
         if len(text) > 10:
             return text.replace("\n", " ")[:100]
 
     return "(no readable title)"
 
 
-def cmd_list(args: argparse.Namespace) -> int:
-    files = iter_jsonl_files()
+def normalize_path(value: str | pathlib.Path) -> pathlib.Path:
+    return pathlib.Path(value).expanduser().resolve()
 
-    if not files:
+
+def path_matches(cwd: str, target: str | pathlib.Path) -> bool:
+    if not cwd:
+        return False
+
+    target_text = str(target).strip()
+    cwd_text = str(cwd).strip()
+
+    if not target_text:
+        return True
+
+    if target_text.lower() in cwd_text.lower():
+        return True
+
+    try:
+        cwd_path = normalize_path(cwd_text)
+        target_path = normalize_path(target_text)
+    except Exception:
+        return False
+
+    if cwd_path == target_path:
+        return True
+
+    try:
+        cwd_path.relative_to(target_path)
+        return True
+    except ValueError:
+        pass
+
+    try:
+        target_path.relative_to(cwd_path)
+        return True
+    except ValueError:
+        return False
+
+
+def filter_records(records: list[SessionRecord], repo: str | None = None, project: str | None = None) -> list[SessionRecord]:
+    filtered = records
+
+    if repo:
+        filtered = [record for record in filtered if path_matches(record.cwd, repo)]
+
+    if project:
+        filtered = [record for record in filtered if path_matches(record.cwd, project)]
+
+    return filtered
+
+
+def print_record(index: int, record: SessionRecord) -> None:
+    mtime = datetime.fromtimestamp(record.mtime).strftime("%Y-%m-%d %H:%M:%S")
+    title = infer_title(record.rows)
+
+    print(f"[{index}] {mtime}")
+    print(f"    file: {record.path}")
+    if record.cwd:
+        print(f"    cwd : {record.cwd}")
+    if record.provider:
+        print(f"    provider: {record.provider}")
+    print(f"    title: {title}")
+    print()
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    records = load_records()
+
+    if not records:
         print("No Codex session JSONL files found.")
         return 1
 
-    for index, path in enumerate(files[: args.limit], 1):
-        rows = load_jsonl(path)
-        meta = get_meta(rows)
-        stat = path.stat()
+    records = filter_records(records, repo=args.repo, project=args.project)
 
-        mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-        cwd = meta.get("cwd") or meta.get("working_directory") or meta.get("workspace") or ""
-        provider = meta.get("model_provider") or meta.get("provider") or ""
-        title = infer_title(rows)
+    if not records:
+        print("No Codex sessions matched the current filter.")
+        if args.repo:
+            print(f"Tried --repo: {normalize_path(args.repo)}")
+        if args.project:
+            print(f"Tried --project: {args.project}")
+        print("Try: codex-handoff list --limit 200")
+        print("Or:  codex-handoff list --project <folder-name-or-path> --limit 200")
+        return 1
 
-        print(f"[{index}] {mtime}")
-        print(f"    file: {path}")
-        if cwd:
-            print(f"    cwd : {cwd}")
-        if provider:
-            print(f"    provider: {provider}")
-        print(f"    title: {title}")
-        print()
+    for index, record in enumerate(records[: args.limit], 1):
+        print_record(index, record)
 
     return 0
 
@@ -227,26 +340,45 @@ def run_git(repo: pathlib.Path, git_args: list[str]) -> str:
         return f"[git command failed: {exc}]"
 
 
+def git_root(repo: pathlib.Path) -> pathlib.Path | None:
+    output = run_git(repo, ["rev-parse", "--show-toplevel"]).strip()
+    if not output or output.startswith("fatal:") or output.startswith("[git command failed:"):
+        return None
+    return pathlib.Path(output)
+
+
+def write_git_snapshot(repo: pathlib.Path, out_dir: pathlib.Path) -> None:
+    root = git_root(repo)
+
+    if root is None:
+        message = f"Not a git repository: {repo}\n"
+        (out_dir / "git_status.txt").write_text(message, encoding="utf-8")
+        (out_dir / "git_diff.patch").write_text(message, encoding="utf-8")
+        (out_dir / "git_log.txt").write_text(message, encoding="utf-8")
+        return
+
+    (out_dir / "git_status.txt").write_text(
+        run_git(root, ["status", "--short", "--branch"]),
+        encoding="utf-8",
+    )
+
+    (out_dir / "git_diff.patch").write_text(
+        run_git(root, ["diff", "--stat"]) + "\n\n" + run_git(root, ["diff"]),
+        encoding="utf-8",
+    )
+
+    (out_dir / "git_log.txt").write_text(
+        run_git(root, ["log", "--oneline", "-30"]),
+        encoding="utf-8",
+    )
+
+
 def make_handoff(session_path: pathlib.Path, repo: pathlib.Path, out_dir: pathlib.Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     raw_path = out_dir / "CODEX_SESSION_RAW.md"
     export_session(session_path, raw_path)
-
-    (out_dir / "git_status.txt").write_text(
-        run_git(repo, ["status", "--short", "--branch"]),
-        encoding="utf-8",
-    )
-
-    (out_dir / "git_diff.patch").write_text(
-        run_git(repo, ["diff", "--stat"]) + "\n\n" + run_git(repo, ["diff"]),
-        encoding="utf-8",
-    )
-
-    (out_dir / "git_log.txt").write_text(
-        run_git(repo, ["log", "--oneline", "-30"]),
-        encoding="utf-8",
-    )
+    write_git_snapshot(repo, out_dir)
 
     handoff = f"""# HANDOFF
 
@@ -257,9 +389,9 @@ This directory was generated from a local Codex session and the current Git repo
 ## Files
 
 1. `CODEX_SESSION_RAW.md` — readable text extracted from the Codex JSONL session.
-2. `git_status.txt` — current Git status.
-3. `git_diff.patch` — current uncommitted diff.
-4. `git_log.txt` — recent commit history.
+2. `git_status.txt` — current Git status, or a clear note when the provided repo path is not a Git repository.
+3. `git_diff.patch` — current uncommitted diff, when available.
+4. `git_log.txt` — recent commit history, when available.
 
 ## Source
 
@@ -279,6 +411,14 @@ This directory was generated from a local Codex session and the current Git repo
     (out_dir / "HANDOFF.md").write_text(handoff, encoding="utf-8")
 
 
+def resolve_auto_session(repo: pathlib.Path, project: str | None = None) -> pathlib.Path | None:
+    records = load_records()
+    filtered = filter_records(records, repo=str(repo), project=project)
+    if filtered:
+        return filtered[0].path
+    return None
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     session = pathlib.Path(args.session).expanduser()
     out = pathlib.Path(args.out).expanduser()
@@ -293,16 +433,33 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_make(args: argparse.Namespace) -> int:
-    session = pathlib.Path(args.session).expanduser()
     repo = pathlib.Path(args.repo).expanduser().resolve()
     out_dir = pathlib.Path(args.out_dir).expanduser()
 
-    if not session.exists():
-        print(f"Session file not found: {session}")
-        return 1
-
     if not repo.exists():
         print(f"Repository path not found: {repo}")
+        return 1
+
+    if args.auto:
+        session = resolve_auto_session(repo, project=args.project)
+        if session is None:
+            print("No matching Codex session found for this project.")
+            print(f"Tried repo: {repo}")
+            if args.project:
+                print(f"Tried project filter: {args.project}")
+            print("Try: codex-handoff list --repo . --limit 200")
+            print("Or:  codex-handoff list --project <folder-name-or-path> --limit 200")
+            return 1
+        print(f"Auto-selected session: {session}")
+    else:
+        if not args.session:
+            print("Session path is required unless --auto is used.")
+            print("Try: codex-handoff make --auto --repo . --out-dir .agent_handoff")
+            return 1
+        session = pathlib.Path(args.session).expanduser()
+
+    if not session.exists():
+        print(f"Session file not found: {session}")
         return 1
 
     make_handoff(session, repo, out_dir)
@@ -316,6 +473,8 @@ def main() -> int:
 
     parser_list = sub.add_parser("list", help="List recent local Codex JSONL sessions.")
     parser_list.add_argument("--limit", type=int, default=20)
+    parser_list.add_argument("--repo", help="Only show sessions whose cwd matches this repo/path.")
+    parser_list.add_argument("--project", help="Only show sessions whose cwd contains this project name/path.")
     parser_list.set_defaults(func=cmd_list)
 
     parser_export = sub.add_parser("export", help="Export one Codex session JSONL file to Markdown.")
@@ -324,7 +483,9 @@ def main() -> int:
     parser_export.set_defaults(func=cmd_export)
 
     parser_make = sub.add_parser("make", help="Create a handoff directory from a session and repo state.")
-    parser_make.add_argument("session")
+    parser_make.add_argument("session", nargs="?")
+    parser_make.add_argument("--auto", action="store_true", help="Auto-select the newest session matching --repo/--project.")
+    parser_make.add_argument("--project", help="Optional project name/path filter when using --auto.")
     parser_make.add_argument("--repo", default=".")
     parser_make.add_argument("--out-dir", default=".agent_handoff")
     parser_make.set_defaults(func=cmd_make)
