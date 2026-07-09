@@ -72,3 +72,7 @@ Read .agent_handoff/HANDOFF.md and continue the project. First summarize the cur
 ## License
 
 MIT
+
+## 中文版本
+
+中文版本请查看 [README_CN.md](README_CN.md)
